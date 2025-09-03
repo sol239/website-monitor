@@ -416,7 +416,15 @@ class MonitorChecker:
                 valid_results.append(result)
                 # Save to database asynchronously
                 monitor, check_result = result
-                await self._save_result_async(monitor, check_result)
+                try:
+                    await self._save_result_async(monitor, check_result)
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "foreign key constraint" in error_str or "1452" in error_str or "cannot add or update a child row" in error_str:
+                        logger.warning(f"Monitor {monitor.id} appears to be deleted from DB, removing from loop")
+                        self._remove_monitor_from_loop(monitor)
+                    else:
+                        logger.error(f"Failed to save result for monitor {monitor.id}: {e}")
 
         return valid_results
 
@@ -443,7 +451,15 @@ class MonitorChecker:
                 valid_results.append(result)
                 # Save to database asynchronously
                 monitor, check_result = result
-                await self._save_result_async(monitor, check_result)
+                try:
+                    await self._save_result_async(monitor, check_result)
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "foreign key constraint" in error_str or "1452" in error_str or "cannot add or update a child row" in error_str:
+                        logger.warning(f"Monitor {monitor.id} appears to be deleted from DB, removing from loop")
+                        self._remove_monitor_from_loop(monitor)
+                    else:
+                        logger.error(f"Failed to save result for monitor {monitor.id}: {e}")
 
         return valid_results
 
@@ -478,6 +494,19 @@ class MonitorChecker:
                 conn.close()
 
         await asyncio.get_event_loop().run_in_executor(self.executor, _save_result_sync)
+
+    def _remove_monitor_from_loop(self, monitor: Monitor):
+        """Remove a monitor from all lists if it was deleted from DB"""
+        logger.info(f"Removing monitor ID {monitor.id} from monitoring loop due to deletion")
+
+        # Remove from ping_monitors
+        self.ping_monitors = [m for m in self.ping_monitors if m.id != monitor.id]
+
+        # Remove from website_monitors
+        self.website_monitors = [m for m in self.website_monitors if m.id != monitor.id]
+
+        # Remove from monitor_next_checks
+        self.monitor_next_checks = [mc for mc in self.monitor_next_checks if mc["monitor"].id != monitor.id]
 
     async def _calculate_next_check_time(self, monitor: Monitor) -> datetime:
         """Calculate next check time based on last check and periodicity (UTC)"""
@@ -581,7 +610,7 @@ class MonitorChecker:
         logger.info(f"=== Initialization completed in {elapsed:.2f}s ===")
 
     async def _check_monitor_updates(self):
-        """Check monitor_updates table for must_update=1, run check, and reset must_update."""
+        """Check monitor_updates table for must_update=1, run check, reset must_update, and update monitor lists."""
         def _get_updates_sync():
             if not self.db_pool:
                 self._connect_to_database()
@@ -598,8 +627,6 @@ class MonitorChecker:
         monitor_ids = await asyncio.get_event_loop().run_in_executor(self.executor, _get_updates_sync)
         if not monitor_ids:
             return
-
-
 
         # Fetch monitors by id
         def _get_monitor_sync(monitor_id):
@@ -640,18 +667,67 @@ class MonitorChecker:
                 )
                 monitors.append(monitor)
 
-        # Run checks for each monitor and reset must_update
+        # Run checks for each monitor and update monitor lists
         for monitor in monitors:
             if monitor.monitor_type == "ping":
-                logger.info("Running ping update check.")
+                logger.info(f"Running ping update check for monitor ID {monitor.id}")
                 result = await self._run_single_ping_check(monitor)
+                
+                # Update or add monitor in ping_monitors list
+                monitor_found = False
+                for i, m in enumerate(self.ping_monitors):
+                    if m.id == monitor.id:
+                        self.ping_monitors[i] = monitor
+                        logger.info(f"Updated ping monitor ID {monitor.id} in main list")
+                        monitor_found = True
+                        break
+                if not monitor_found:
+                    self.ping_monitors.append(monitor)
+                    logger.info(f"Added new ping monitor ID {monitor.id} to main list")
+                        
             elif monitor.monitor_type == "website":
-                logger.info("Running website update check.")
-
+                logger.info(f"Running website update check for monitor ID {monitor.id}")
                 result = await self._run_single_website_check(monitor)
+                
+                # Update or add monitor in website_monitors list
+                monitor_found = False
+                for i, m in enumerate(self.website_monitors):
+                    if m.id == monitor.id:
+                        self.website_monitors[i] = monitor
+                        logger.info(f"Updated website monitor ID {monitor.id} in main list")
+                        monitor_found = True
+                        break
+                if not monitor_found:
+                    self.website_monitors.append(monitor)
+                    logger.info(f"Added new website monitor ID {monitor.id} to main list")
+                        
             else:
                 continue
-            await self._save_result_async(monitor, result)
+                
+            try:
+                await self._save_result_async(monitor, result)
+            except Exception as e:
+                error_str = str(e).lower()
+                if "foreign key constraint" in error_str or "1452" in error_str or "cannot add or update a child row" in error_str:
+                    logger.warning(f"Monitor {monitor.id} appears to be deleted from DB during update check, removing from loop")
+                    self._remove_monitor_from_loop(monitor)
+                    continue  # Skip further processing for this monitor
+                else:
+                    logger.error(f"Failed to save result for monitor {monitor.id}: {e}")
+
+            # Update or add monitor in monitor_next_checks and schedule immediate check
+            monitor_check_found = False
+            for i, monitor_check in enumerate(self.monitor_next_checks):
+                if monitor_check["monitor"].id == monitor.id:
+                    self.monitor_next_checks[i]["monitor"] = monitor
+                    # Schedule for immediate check
+                    self.monitor_next_checks[i]["next_check_time"] = datetime.now(UTC)
+                    logger.info(f"Updated monitor ID {monitor.id} in scheduling queue for immediate check")
+                    monitor_check_found = True
+                    break
+            if not monitor_check_found:
+                self.monitor_next_checks.append({"monitor": monitor, "next_check_time": datetime.now(UTC)})
+                logger.info(f"Added new monitor ID {monitor.id} to scheduling queue for immediate check")
 
             # Reset must_update to 0
             def _reset_update_sync(monitor_id):
@@ -665,6 +741,14 @@ class MonitorChecker:
                     cursor.close()
                     conn.close()
             await asyncio.get_event_loop().run_in_executor(self.executor, _reset_update_sync, monitor.id)
+            
+            # Recalculate next check time after immediate check
+            next_check_time = await self._calculate_next_check_time(monitor)
+            for i, monitor_check in enumerate(self.monitor_next_checks):
+                if monitor_check["monitor"].id == monitor.id:
+                    self.monitor_next_checks[i]["next_check_time"] = next_check_time
+                    logger.info(f"Rescheduled monitor ID {monitor.id} for next check at {next_check_time}")
+                    break
 
     async def run_monitoring_loop(self):
         """Enhanced monitoring loop with better performance tracking"""

@@ -18,30 +18,48 @@ if (file_exists($envPath)) {
 // Set timezone to UTC for all date/time operations
 date_default_timezone_set('UTC');
 
+/**
+ * Class MonitorChecker
+ *
+ * Handles monitoring checks for ping and website monitors,
+ * manages database connections, scheduling, and logging.
+ */
 class MonitorChecker
 {
     /**
      * A list of ping monitors to check.
+     * @var array
      */
     private array $pingMonitors;
 
     /**
      * A list of website monitors to check.
+     * @var array
      */
     private array $websiteMonitors;
 
     /**
      * The path to the SQLite database file.
+     * @var string
      */
     public static string $DB_PATH = __DIR__.'/../../database/database.sqlite';
 
     /**
      * The PDO instance for database connections.
+     * @var PDO
      */
     private PDO $pdo;
 
+    /**
+     * Stores next check times for all monitors.
+     * @var array
+     */
     public array $monitorNextChecks = [];
 
+    /**
+     * MonitorChecker constructor.
+     * Initializes database connection and loads monitors.
+     */
     public function __construct()
     {
         $this->connectToDatabase();
@@ -80,12 +98,48 @@ class MonitorChecker
 
     private function hasLog($monitor): bool
     {
+        if (!$monitor || !isset($monitor['id'])) {
+            echo "Warning: Invalid monitor data provided to hasLog\n";
+            return false;
+        }
+
         $stmt = $this->pdo->prepare('SELECT COUNT(*) FROM monitor_logs WHERE monitor_id = :monitor_id');
         $stmt->execute(['monitor_id' => $monitor['id']]);
 
         return $stmt->fetchColumn() > 0;
     }
 
+    /**
+     * Removes a monitor from all internal lists if it was deleted from DB.
+     *
+     * @param int $monitorId The ID of the monitor to remove.
+     * @return void
+     */
+    private function removeMonitorFromLoop(int $monitorId): void
+    {
+        echo "Removing monitor ID {$monitorId} from monitoring loop due to deletion\n";
+
+        // Remove from pingMonitors
+        $this->pingMonitors = array_filter($this->pingMonitors, function($m) use ($monitorId) {
+            return isset($m['id']) && $m['id'] != $monitorId;
+        });
+
+        // Remove from websiteMonitors
+        $this->websiteMonitors = array_filter($this->websiteMonitors, function($m) use ($monitorId) {
+            return isset($m['id']) && $m['id'] != $monitorId;
+        });
+
+        // Remove from monitorNextChecks
+        $this->monitorNextChecks = array_filter($this->monitorNextChecks, function($mc) use ($monitorId) {
+            return isset($mc['monitor']['id']) && $mc['monitor']['id'] != $monitorId;
+        });
+    }
+
+    /**
+     * Prints information about all ping and website monitors.
+     *
+     * @return void
+     */
     public function printInformation(): void
     {
         echo 'Ping Monitors ['.count($this->pingMonitors)."]:\n";
@@ -98,8 +152,19 @@ class MonitorChecker
         }
     }
 
+    /**
+     * Runs a check for a ping monitor and logs the result.
+     *
+     * @param array $pingMonitor The ping monitor configuration.
+     * @return void
+     */
     private function runPingMonitorCheck($pingMonitor): void
     {
+        if (!$pingMonitor || !isset($pingMonitor['id']) || !isset($pingMonitor['hostname']) || !isset($pingMonitor['port'])) {
+            echo "Warning: Invalid ping monitor data provided\n";
+            return;
+        }
+
         $host = $pingMonitor['hostname'];
         $port = (int) $pingMonitor['port'];
 
@@ -117,24 +182,45 @@ class MonitorChecker
         }
 
         // INSERTING RESULT INTO DB
-        $stmt = $this->pdo->prepare('
-            INSERT INTO monitor_logs (monitor_id, started_at, status, response_time_ms, created_at, updated_at)
-            VALUES (:monitor_id, :started_at, :status, :response_time_ms, :created_at, :updated_at)
-        ');
-        $stmt->execute([
-            'monitor_id' => $pingMonitor['id'],
-            'started_at' => gmdate('Y-m-d H:i:s', $start),
-            'status' => $status,
-            'response_time_ms' => $responseTime,
-            'created_at' => gmdate('Y-m-d H:i:s'),
-            'updated_at' => gmdate('Y-m-d H:i:s'),
-        ]);
+        try {
+            $stmt = $this->pdo->prepare('
+                INSERT INTO monitor_logs (monitor_id, started_at, status, response_time_ms, created_at, updated_at)
+                VALUES (:monitor_id, :started_at, :status, :response_time_ms, :created_at, :updated_at)
+            ');
+            $stmt->execute([
+                'monitor_id' => $pingMonitor['id'],
+                'started_at' => gmdate('Y-m-d H:i:s', $start),
+                'status' => $status,
+                'response_time_ms' => $responseTime,
+                'created_at' => gmdate('Y-m-d H:i:s'),
+                'updated_at' => gmdate('Y-m-d H:i:s'),
+            ]);
 
-        echo "Log saved for monitor ID {$pingMonitor['id']}.\n";
+            echo "Log saved for monitor ID {$pingMonitor['id']}.\n";
+        } catch (PDOException $e) {
+            $errorMessage = $e->getMessage();
+            if (strpos($errorMessage, 'Integrity constraint violation') !== false || strpos($errorMessage, 'foreign key constraint') !== false || $e->getCode() == 23000) {
+                echo "Monitor ID {$pingMonitor['id']} appears to be deleted from DB, removing from loop\n";
+                $this->removeMonitorFromLoop($pingMonitor['id']);
+            } else {
+                echo "Failed to save log for monitor ID {$pingMonitor['id']}: {$errorMessage}\n";
+            }
+        }
     }
 
+    /**
+     * Runs a check for a website monitor and logs the result.
+     *
+     * @param array $websiteMonitor The website monitor configuration.
+     * @return void
+     */
     public function runWebsiteMonitorCheck($websiteMonitor): void
     {
+        if (!$websiteMonitor || !isset($websiteMonitor['id']) || !isset($websiteMonitor['url'])) {
+            echo "Warning: Invalid website monitor data provided\n";
+            return;
+        }
+
         $url = $websiteMonitor['url'];
         $checkStatus = ! empty($websiteMonitor['check_status']) && $websiteMonitor['check_status'];
         $keywords = [];
@@ -188,22 +274,38 @@ class MonitorChecker
         curl_close($ch);
 
         // INSERTING RESULT INTO DB
-        $stmt = $this->pdo->prepare('
-            INSERT INTO monitor_logs (monitor_id, started_at, status, response_time_ms, created_at, updated_at)
-            VALUES (:monitor_id, :started_at, :status, :response_time_ms, :created_at, :updated_at)
-        ');
-        $stmt->execute([
-            'monitor_id' => $websiteMonitor['id'],
-            'started_at' => gmdate('Y-m-d H:i:s', $start),
-            'status' => $status,
-            'response_time_ms' => $responseTime,
-            'created_at' => gmdate('Y-m-d H:i:s'),
-            'updated_at' => gmdate('Y-m-d H:i:s'),
-        ]);
+        try {
+            $stmt = $this->pdo->prepare('
+                INSERT INTO monitor_logs (monitor_id, started_at, status, response_time_ms, created_at, updated_at)
+                VALUES (:monitor_id, :started_at, :status, :response_time_ms, :created_at, :updated_at)
+            ');
+            $stmt->execute([
+                'monitor_id' => $websiteMonitor['id'],
+                'started_at' => gmdate('Y-m-d H:i:s', $start),
+                'status' => $status,
+                'response_time_ms' => $responseTime,
+                'created_at' => gmdate('Y-m-d H:i:s'),
+                'updated_at' => gmdate('Y-m-d H:i:s'),
+            ]);
 
-        echo "Log saved for website monitor ID {$websiteMonitor['id']}.\n";
+            echo "Log saved for website monitor ID {$websiteMonitor['id']}.\n";
+        } catch (PDOException $e) {
+            $errorMessage = $e->getMessage();
+            if (strpos($errorMessage, 'Integrity constraint violation') !== false || strpos($errorMessage, 'foreign key constraint') !== false || $e->getCode() == 23000) {
+                echo "Monitor ID {$websiteMonitor['id']} appears to be deleted from DB, removing from loop\n";
+                $this->removeMonitorFromLoop($websiteMonitor['id']);
+            } else {
+                echo "Failed to save log for website monitor ID {$websiteMonitor['id']}: {$errorMessage}\n";
+            }
+        }
     }
 
+    /**
+     * Initializes monitor checks, runs first checks if needed,
+     * and schedules next check times.
+     *
+     * @return void
+     */
     public function initializeMonitorChecks(): void
     {
         $currentTime = gmdate('Y-m-d H:i:s');
@@ -214,7 +316,18 @@ class MonitorChecker
             echo 'Monitor ['.$pingMonitor['label'].'] has log: '.($_hasLog ? 'Yes' : 'No')."\n";
 
             if (! $_hasLog) {
-                $this->runPingMonitorCheck($pingMonitor);
+                try {
+                    $this->runPingMonitorCheck($pingMonitor);
+                } catch (PDOException $e) {
+                    $errorMessage = $e->getMessage();
+                    if (strpos($errorMessage, 'Integrity constraint violation') !== false || strpos($errorMessage, 'foreign key constraint') !== false || $e->getCode() == 23000) {
+                        echo "Monitor ID {$pingMonitor['id']} appears to be deleted from DB during initialization, removing from loop\n";
+                        $this->removeMonitorFromLoop($pingMonitor['id']);
+                        continue; // Skip scheduling
+                    } else {
+                        echo "Failed to run initial check for monitor ID {$pingMonitor['id']}: {$errorMessage}\n";
+                    }
+                }
             }
 
             $nextCheckTime = $this->calculateNextCheckTime($pingMonitor);
@@ -231,7 +344,18 @@ class MonitorChecker
             echo 'Website Monitor ['.$websiteMonitor['label'].'] has log: '.($_hasLog ? 'Yes' : 'No')."\n";
 
             if (! $_hasLog) {
-                $this->runWebsiteMonitorCheck($websiteMonitor);
+                try {
+                    $this->runWebsiteMonitorCheck($websiteMonitor);
+                } catch (PDOException $e) {
+                    $errorMessage = $e->getMessage();
+                    if (strpos($errorMessage, 'Integrity constraint violation') !== false || strpos($errorMessage, 'foreign key constraint') !== false || $e->getCode() == 23000) {
+                        echo "Monitor ID {$websiteMonitor['id']} appears to be deleted from DB during initialization, removing from loop\n";
+                        $this->removeMonitorFromLoop($websiteMonitor['id']);
+                        continue; // Skip scheduling
+                    } else {
+                        echo "Failed to run initial check for website monitor ID {$websiteMonitor['id']}: {$errorMessage}\n";
+                    }
+                }
             }
 
             $nextCheckTime = $this->calculateNextCheckTime($websiteMonitor);
@@ -249,9 +373,17 @@ class MonitorChecker
     /**
      * Calculates next check time for a monitor.
      * Uses latest started_at from monitor_logs + monitor['periodicity'] (in seconds).
+     *
+     * @param array $monitor The monitor configuration.
+     * @return string Next check time in UTC (Y-m-d H:i:s).
      */
     private function calculateNextCheckTime($monitor): string
     {
+        if (!$monitor || !isset($monitor['id'])) {
+            echo "Warning: Invalid monitor passed to calculateNextCheckTime\n";
+            return gmdate('Y-m-d H:i:s'); // Return current time as fallback
+        }
+
         $stmt = $this->pdo->prepare('SELECT started_at FROM monitor_logs WHERE monitor_id = :monitor_id ORDER BY started_at DESC LIMIT 1');
         $stmt->execute(['monitor_id' => $monitor['id']]);
         $latestStartedAt = $stmt->fetchColumn();
@@ -267,11 +399,22 @@ class MonitorChecker
         }
     }
 
+    /**
+     * Checks for monitor updates and runs immediate checks if needed.
+     *
+     * @return void
+     */
     private function checkMonitorUpdates(): void
     {
         $stmt = $this->pdo->prepare('SELECT monitor_id FROM monitor_updates WHERE must_update = 1');
         $stmt->execute();
         $monitorIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+        if (empty($monitorIds)) {
+            return;
+        }
+
+        echo "Found " . count($monitorIds) . " monitor(s) requiring updates: " . implode(", ", $monitorIds) . "\n";
 
         foreach ($monitorIds as $monitorId) {
             // Reload monitor from DB
@@ -280,33 +423,60 @@ class MonitorChecker
             $monitor = $stmtMonitor->fetch(PDO::FETCH_ASSOC);
 
             if (! $monitor) {
+                echo "Monitor ID {$monitorId} not found in database, skipping.\n";
                 continue;
             }
 
-            // Update monitor in pingMonitors or websiteMonitors
+            echo "Processing update for monitor ID {$monitorId} [{$monitor['label']}]\n";
+
+            // Update or add monitor in pingMonitors or websiteMonitors
             if ($monitor['monitor_type'] === 'ping') {
+                $found = false;
                 foreach ($this->pingMonitors as $i => $m) {
-                    if ($m['id'] == $monitorId) {
+                    if (isset($m['id']) && $m['id'] == $monitorId) {
                         $this->pingMonitors[$i] = $monitor;
+                        echo "Updated ping monitor ID {$monitorId} in main list\n";
+                        $found = true;
                         break;
                     }
                 }
+                if (!$found) {
+                    $this->pingMonitors[] = $monitor;
+                    echo "Added new ping monitor ID {$monitorId} to main list\n";
+                }
             } elseif ($monitor['monitor_type'] === 'website') {
+                $found = false;
                 foreach ($this->websiteMonitors as $i => $m) {
-                    if ($m['id'] == $monitorId) {
+                    if (isset($m['id']) && $m['id'] == $monitorId) {
                         $this->websiteMonitors[$i] = $monitor;
+                        echo "Updated website monitor ID {$monitorId} in main list\n";
+                        $found = true;
                         break;
                     }
+                }
+                if (!$found) {
+                    $this->websiteMonitors[] = $monitor;
+                    echo "Added new website monitor ID {$monitorId} to main list\n";
                 }
             }
 
-            // Update monitorNextChecks entry
+            // Update or add monitorNextChecks entry
+            $found = false;
             foreach ($this->monitorNextChecks as $i => $mc) {
-                if ($mc['monitor']['id'] == $monitorId) {
+                if (isset($mc['monitor']['id']) && $mc['monitor']['id'] == $monitorId) {
                     $this->monitorNextChecks[$i]['monitor'] = $monitor;
                     $this->monitorNextChecks[$i]['nextCheckTime'] = gmdate('Y-m-d H:i:s'); // run immediately
+                    echo "Updated monitor ID {$monitorId} in scheduling queue for immediate check\n";
+                    $found = true;
                     break;
                 }
+            }
+            if (!$found) {
+                $this->monitorNextChecks[] = [
+                    'monitor' => $monitor,
+                    'nextCheckTime' => gmdate('Y-m-d H:i:s'), // run immediately
+                ];
+                echo "Added new monitor ID {$monitorId} to scheduling queue for immediate check\n";
             }
 
             // Set must_update to 0
@@ -314,22 +484,40 @@ class MonitorChecker
             $stmtUpdate->execute(['monitor_id' => $monitorId]);
 
             // Run check immediately
-            echo "Monitor ID {$monitorId} updated and will be checked immediately.\n";
-            if ($monitor['monitor_type'] === 'ping') {
-                $this->runPingMonitorCheck($monitor);
-            } elseif ($monitor['monitor_type'] === 'website') {
-                $this->runWebsiteMonitorCheck($monitor);
+            echo "Running immediate check for updated monitor ID {$monitorId}\n";
+            try {
+                if ($monitor['monitor_type'] === 'ping') {
+                    $this->runPingMonitorCheck($monitor);
+                } elseif ($monitor['monitor_type'] === 'website') {
+                    $this->runWebsiteMonitorCheck($monitor);
+                }
+            } catch (PDOException $e) {
+                $errorMessage = $e->getMessage();
+                if (strpos($errorMessage, 'Integrity constraint violation') !== false || strpos($errorMessage, 'foreign key constraint') !== false || $e->getCode() == 23000) {
+                    echo "Monitor ID {$monitorId} appears to be deleted from DB during update check, removing from loop\n";
+                    $this->removeMonitorFromLoop($monitorId);
+                    continue; // Skip further processing for this monitor
+                } else {
+                    echo "Failed to run check for monitor ID {$monitorId}: {$errorMessage}\n";
+                }
             }
+            
             // Update next check time after immediate check
             foreach ($this->monitorNextChecks as $i => $mc) {
-                if ($mc['monitor']['id'] == $monitorId) {
+                if (isset($mc['monitor']['id']) && $mc['monitor']['id'] == $monitorId) {
                     $this->monitorNextChecks[$i]['nextCheckTime'] = $this->calculateNextCheckTime($monitor);
+                    echo "Rescheduled monitor ID {$monitorId} for next check at: {$this->monitorNextChecks[$i]['nextCheckTime']}\n";
                     break;
                 }
             }
         }
     }
 
+    /**
+     * Runs the main monitoring loop, checking monitors at scheduled times.
+     *
+     * @return void
+     */
     public function runChecks(): void
     {
         echo "=== Running main loop ===\n";
@@ -341,20 +529,41 @@ class MonitorChecker
             $this->checkMonitorUpdates();
 
             foreach ($this->monitorNextChecks as $index => $monitorCheck) {
+                if (!isset($monitorCheck['monitor']) || !is_array($monitorCheck['monitor'])) {
+                    echo "Warning: Invalid monitor check entry at index {$index}, skipping\n";
+                    continue;
+                }
+
+                $monitor = $monitorCheck['monitor'];
+                if (!isset($monitor['id']) || !isset($monitor['monitor_type'])) {
+                    echo "Warning: Monitor at index {$index} is missing required fields, skipping\n";
+                    continue;
+                }
+
                 $nextCheckTimestamp = strtotime($monitorCheck['nextCheckTime'] . ' UTC');
                 $x = $currentTime >= $nextCheckTimestamp;
                 // echo "Current: " . date('Y-m-d H:i:s', $currentTime) . " - Next Check: " . $monitorCheck['nextCheckTime'] . " - " . ($x ? 'true' : 'false') . "\n";
                 if ($currentTime >= $nextCheckTimestamp) {
-                    $monitor = $monitorCheck['monitor'];
                     echo "Running check for monitor ID {$monitor['id']} at ".gmdate('Y-m-d H:i:s')."\n";
 
-                    if ($monitor['monitor_type'] === 'ping') {
-                        $this->runPingMonitorCheck($monitor);
-                    } elseif ($monitor['monitor_type'] === 'website') {
-                        $this->runWebsiteMonitorCheck($monitor);
+                    try {
+                        if ($monitor['monitor_type'] === 'ping') {
+                            $this->runPingMonitorCheck($monitor);
+                        } elseif ($monitor['monitor_type'] === 'website') {
+                            $this->runWebsiteMonitorCheck($monitor);
+                        }
+                    } catch (PDOException $e) {
+                        $errorMessage = $e->getMessage();
+                        if (strpos($errorMessage, 'Integrity constraint violation') !== false || strpos($errorMessage, 'foreign key constraint') !== false || $e->getCode() == 23000) {
+                            echo "Monitor ID {$monitor['id']} appears to be deleted from DB, removing from loop\n";
+                            $this->removeMonitorFromLoop($monitor['id']);
+                            continue; // Skip updating next check time
+                        } else {
+                            echo "Failed to run check for monitor ID {$monitor['id']}: {$errorMessage}\n";
+                        }
                     }
 
-                    // Update next check time for this specific monitor
+                    // Update next check for this specific monitor
                     $this->monitorNextChecks[$index]['nextCheckTime'] = $this->calculateNextCheckTime($monitor);
                     echo "Next check for monitor ID {$monitor['id']} scheduled at: ".$this->monitorNextChecks[$index]['nextCheckTime']."\n";
                 }

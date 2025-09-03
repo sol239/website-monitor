@@ -71,12 +71,12 @@ services:
 
   checker-service:
     build:
-      context: ./services/php-checker
+      context: ./services/python-checker
       dockerfile: Dockerfile
-    container_name: php-checker
+    container_name: python-checker
     working_dir: /app
     volumes:
-      - ./services/php-checker:/app:cached
+      - ./services/python-checker:/app:cached
     environment:
       DB_CONNECTION: ${DB_CONNECTION}
       DB_HOST: mysql
@@ -89,7 +89,7 @@ services:
         condition: service_healthy
       app:
         condition: service_healthy
-    command: php main.php
+    command: python main.py
 
 volumes:
   mysql_data:
