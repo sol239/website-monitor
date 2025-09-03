@@ -491,13 +491,6 @@ function cycleStatusFilter() {
                                     class="w-full rounded border bg-gray-50 px-3 py-2 dark:bg-zinc-900"
                                 />
                             </div>
-                            <div>
-                                <label class="mb-1 block text-sm font-medium">Status</label>
-                                <select v-model="monitorStatus" class="w-full rounded border bg-gray-50 px-3 py-2 dark:bg-zinc-900">
-                                    <option value="succeeded">Succeeded</option>
-                                    <option value="failed">Failed</option>
-                                </select>
-                            </div>
                         </div>
 
                         <!-- Ping Monitor Specific Fields -->

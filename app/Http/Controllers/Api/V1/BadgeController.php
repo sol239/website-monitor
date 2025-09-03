@@ -47,7 +47,7 @@ class BadgeController extends Controller
      */
     public function show($monitorId)
     {
-        $monitor = Monitor::find($monitorId);
+            $monitor = Monitor::find($monitorId);
 
         if (! $monitor) {
             Log::error('Monitor not found', ['monitorId' => $monitorId]);

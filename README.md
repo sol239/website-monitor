@@ -21,7 +21,7 @@ This is a straightforward website and server monitoring application designed to 
 
 ### With Docker Compose 🐳
 
-In `.env` file you need to set DB_HOST to `my_sql` which is the name of the DB service in compose file.
+In `.env` file you need to set DB_HOST to `mysql` which is the name of the DB service in compose file.
 
 ```shell
 git clone https://github.com/sol239/uptime-monitor
